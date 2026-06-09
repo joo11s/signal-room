@@ -26,23 +26,12 @@ try:
 except ImportError:
     PPTX_AVAILABLE = False
 
-# ─────────────────────────────────────────────
-# gspread / google-auth
-# ─────────────────────────────────────────────
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials as SACredentials
-    GSPREAD_AVAILABLE = True
-except ImportError:
-    GSPREAD_AVAILABLE = False
-
 AGENTS_DIR = Path(__file__).parent / "agents"
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Google Sheets
-HAPPYBIZ_DB_ID = "1a8q2J6LXrzSf8BozovoABnGZ6brLEQPQvV5JCTPm3QI"
-SHEET_NAME = "signal_room_results"
+# n8n webhook for Google Sheets
+N8N_SHEETS_WEBHOOK = "https://n8n.wonflowai.com/webhook/signal-room-sheets-save"
 
 # R2 / CDN
 R2_UPLOADER = "https://r2-uploader.joo11s11.workers.dev"
@@ -119,65 +108,35 @@ def run_qa_with_rerun(all_outputs: dict, max_retries: int = 2) -> dict:
 
 
 # ─────────────────────────────────────────────
-# Feature A: Google Sheets 저장
+# Feature A: Google Sheets 저장 (via n8n webhook)
 # ─────────────────────────────────────────────
 
 def save_to_gsheet(product: str, research: dict, strategy: dict,
                    plan_margin: dict, blog: dict, qa_result: dict,
                    date_str: str) -> bool:
-    """결과를 HAPPYBIZ_DB > signal_room_results 시트에 저장"""
-    if not GSPREAD_AVAILABLE:
-        print("[SHEETS] gspread 패키지 없음 — 건너뜀")
-        return False
-
-    creds_path = (
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        or os.path.expanduser("~/ailab/shared/config/service_account.json")
-    )
-
-    if not Path(creds_path).exists():
-        print(f"[SHEETS] 서비스 계정 JSON 없음: {creds_path}")
-        print("[SHEETS] 설정: ~/ailab/shared/config/service_account.json 에 키 저장 후 재실행")
-        return False
-
+    """결과를 n8n webhook → HAPPYBIZ_DB > signal_room_results 시트에 저장"""
+    profit = plan_margin.get("profit_scenarios", {})
+    payload = {
+        "date": date_str,
+        "product_name": product,
+        "research": str(research.get("buyer_profile", research.get("status", "-")))[:500],
+        "strategy": str(strategy.get("trend_direction", strategy.get("status", "-")))[:500],
+        "plan": str(plan_margin.get("monthly_calendar", plan_margin.get("status", "-")))[:500],
+        "margin_conservative": str(profit.get("conservative", {}).get("net_profit", "-")),
+        "margin_mid": str(profit.get("middle", {}).get("net_profit", "-")),
+        "margin_optimistic": str(profit.get("optimistic", {}).get("net_profit", "-")),
+        "blog_title": str(blog.get("blog_title", blog.get("status", "-"))),
+        "qa_result": "PASS" if qa_result.get("pass") else "FAIL",
+    }
     try:
-        scopes = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = SACredentials.from_service_account_file(creds_path, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(HAPPYBIZ_DB_ID)
-
-        try:
-            ws = sh.worksheet(SHEET_NAME)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=20)
-            ws.append_row([
-                "날짜", "상품명", "research요약", "strategy요약", "plan요약",
-                "margin_보수", "margin_중간", "margin_낙관",
-                "blog_제목", "qa_판정",
-            ])
-
-        profit = plan_margin.get("profit_scenarios", {})
-        row = [
-            date_str,
-            product,
-            str(research.get("buyer_profile", research.get("status", "-")))[:500],
-            str(strategy.get("trend_direction", strategy.get("status", "-")))[:500],
-            str(plan_margin.get("monthly_calendar", plan_margin.get("status", "-")))[:500],
-            str(profit.get("conservative", {}).get("net_profit", "-")),
-            str(profit.get("middle", {}).get("net_profit", "-")),
-            str(profit.get("optimistic", {}).get("net_profit", "-")),
-            str(blog.get("blog_title", blog.get("status", "-"))),
-            "PASS" if qa_result.get("pass") else "FAIL",
-        ]
-        ws.append_row(row)
-        print(f"[SHEETS] ✓ 저장 완료 → 시트: {SHEET_NAME}")
-        return True
-
+        resp = requests.post(N8N_SHEETS_WEBHOOK, json=payload, timeout=15)
+        if resp.status_code == 200:
+            print("[SHEETS] ✓ 저장 완료 → n8n webhook → signal_room_results")
+            return True
+        print(f"[SHEETS] 저장 실패 {resp.status_code}: {resp.text[:300]}")
+        return False
     except Exception as exc:
-        print(f"[SHEETS] 저장 실패: {exc}")
+        print(f"[SHEETS] 저장 오류: {exc}")
         return False
 
 
